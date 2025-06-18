@@ -3,95 +3,122 @@
 #include <vector>
 #include <thread>
 #include <mutex>
+#include <chrono>
+#include <algorithm>
 
-const int BLOCK_SIZE = 1024 * 1024; // 1MB per block
-std::mutex file_mutex;
+std::mutex fileMutex;       // For safe file access
+std::mutex outputMutex;     // For safe output (if needed)
 
-// Naive Run-Length Encoding compression
-std::string rle_compress(const std::string &data)
-{
-    std::string compressed;
-    size_t len = data.length();
-    for (size_t i = 0; i < len;)
-    {
-        char current = data[i];
-        size_t count = 1;
-        while (i + count < len && data[i + count] == current && count < 255)
-        {
-            count++;
+// Structure to hold chunk data
+struct Chunk {
+    std::vector<unsigned char> originalData;
+    std::vector<unsigned char> compressedData;
+};
+
+// Simple RLE compression: [A,A,A] → [3,A]
+void compressRLEChunk(Chunk &chunk) {
+    const std::vector<unsigned char> &input = chunk.originalData;
+    std::vector<unsigned char> &output = chunk.compressedData;
+
+    size_t i = 0;
+    while (i < input.size()) {
+        unsigned char value = input[i];
+        unsigned char count = 1;
+
+        while ((i + count < input.size()) && (input[i + count] == value) && (count < 255)) {
+            ++count;
         }
-        compressed += static_cast<char>(count);
-        compressed += current;
+
+        output.push_back(count);
+        output.push_back(value);
         i += count;
     }
-    return compressed;
 }
 
-// Thread function to read, compress, and store a block
-void compress_block(std::ifstream &file, std::vector<std::string> &results, int block_index, int total_blocks)
-{
-    std::vector<char> buffer(BLOCK_SIZE);
-    {
-        std::lock_guard<std::mutex> lock(file_mutex);
-        file.seekg(block_index * BLOCK_SIZE);
-        file.read(buffer.data(), BLOCK_SIZE);
-    }
+int main() {
+    std::string inputFile, outputFile;
+    std::cout << "Enter input filename to compress: ";
+    std::cin >> inputFile;
+    std::cout << "Enter output compressed filename: ";
+    std::cin >> outputFile;
 
-    std::string input_data(buffer.data(), file.gcount());
-    std::string compressed_data = rle_compress(input_data);
-    results[block_index] = compressed_data;
-}
-
-int main()
-{
-    std::ifstream infile("input.txt", std::ios::binary);
-    if (!infile)
-    {
-        std::cerr << "Cannot open input file.\n";
+    std::ifstream infile(inputFile, std::ios::binary);
+    if (!infile) {
+        std::cerr << "Error: Cannot open input file.\n";
         return 1;
     }
 
     infile.seekg(0, std::ios::end);
-    std::streamsize file_size = infile.tellg();
+    size_t totalSize = infile.tellg();
     infile.seekg(0, std::ios::beg);
 
-    int block_count = (file_size + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    std::vector<std::string> compressed_blocks(block_count);
+    const size_t threadCount = std::thread::hardware_concurrency();
+    const size_t chunkSize = (totalSize + threadCount - 1) / threadCount;
+
+    std::vector<Chunk> chunks(threadCount);
+
+    for (size_t i = 0; i < threadCount; ++i) {
+        size_t offset = i * chunkSize;
+        if (offset >= totalSize) break;
+
+        size_t sizeToRead = std::min(chunkSize, totalSize - offset);
+        chunks[i].originalData.resize(sizeToRead);
+
+        infile.seekg(offset, std::ios::beg);
+        infile.read(reinterpret_cast<char *>(chunks[i].originalData.data()), sizeToRead);
+    }
+
+    infile.close();
+
+    auto start = std::chrono::high_resolution_clock::now();
+
     std::vector<std::thread> threads;
-
-    for (int i = 0; i < block_count; ++i)
-    {
-        threads.emplace_back(compress_block, std::ref(infile), std::ref(compressed_blocks), i, block_count);
+    for (auto &chunk : chunks) {
+        threads.emplace_back(compressRLEChunk, std::ref(chunk));
     }
 
-    for (auto &t : threads)
-        t.join();
-
-    std::ofstream outfile("compressed_output.rle", std::ios::binary);
-    for (const auto &block : compressed_blocks)
-    {
-        uint32_t size = block.size();
-        outfile.write(reinterpret_cast<const char *>(&size), sizeof(size)); // Block size
-        outfile.write(block.data(), size);                                  // Block data
+    for (auto &thread : threads) {
+        thread.join();
     }
 
-    std::cout << "Compression complete. Compressed " << block_count << " blocks.\n";
-    // After determining file_size:
-    std::cout << "Original file size: " << file_size << " bytes\n";
+    auto end = std::chrono::high_resolution_clock::now();
+    std::cout << "Compression took "
+              << std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count()
+              << " ms\n";
 
-    // ... [compression happens here] ...
+    std::ofstream outfile(outputFile, std::ios::binary);
+    if (!outfile) {
+        std::cerr << "Error: Cannot open output file.\n";
+        return 1;
+    }
 
-    // After writing to output file
-    outfile.close(); // ensure file is flushed and closed
+    // Write number of chunks
+    size_t chunkCount = chunks.size();
+    outfile.write(reinterpret_cast<char *>(&chunkCount), sizeof(chunkCount));
 
-    std::ifstream result("compressed_output.rle", std::ios::binary | std::ios::ate);
-    std::streamsize compressed_size = result.tellg();
+    // Write metadata and compressed content
+    for (const auto &chunk : chunks) {
+        size_t originalSize = chunk.originalData.size();
+        size_t compressedSize = chunk.compressedData.size();
+        outfile.write(reinterpret_cast<const char *>(&originalSize), sizeof(originalSize));
+        outfile.write(reinterpret_cast<const char *>(&compressedSize), sizeof(compressedSize));
+        outfile.write(reinterpret_cast<const char *>(chunk.compressedData.data()), compressedSize);
+    }
+
+    outfile.close();
+
+    // Report size and ratio
+    std::ifstream result(outputFile, std::ios::binary | std::ios::ate);
+    std::streamsize compressedSize = result.tellg();
     result.close();
 
-    std::cout << "Compressed file size: " << compressed_size << " bytes\n";
+    std::cout << "Original file size: " << totalSize << " bytes\n";
+    std::cout << "Compressed file size: " << compressedSize << " bytes\n";
 
-    double ratio = 100.0 * (1.0 - (double)compressed_size / file_size);
+    double ratio = 100.0 * (1.0 - static_cast<double>(compressedSize) / totalSize);
     std::cout << "Compression ratio: " << ratio << "%\n";
 
+    std::cout << "Compression complete. Output saved to " << outputFile << std::endl;
     return 0;
 }
+
